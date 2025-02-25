@@ -1,28 +1,38 @@
 use std::borrow::Cow;
 
 use naga_oil::compose::{Composer, ComposerError, ComposerErrorInner};
-use regex::{Captures, Regex};
+use regex::Regex;
 
 lazy_static::lazy_static! {
-    static ref UNDECORATE_REGEX: Regex = Regex::new("_naga_oil_mod_([A-Z0-9]*)_member").unwrap();
+    static ref UNDECORATE_REGEX: Regex = Regex::new("(.+)X_naga_oil_mod_X([A-Z0-9]*)X").unwrap();
 }
 
-fn demangle_mod_names(source: &str, pad: bool) -> Cow<'_, str> {
-    UNDECORATE_REGEX.replace_all(source, |capture: &Captures<'_>| {
-        let module = capture.get(1).unwrap();
-        let module = String::from_utf8(
-            data_encoding::BASE32_NOPAD
-                .decode(module.as_str().as_bytes())
-                .unwrap(),
-        )
-        .unwrap();
+pub(crate) fn decompose_mangled_name(source: &str) -> Option<(String, &str)> {
+    let captures = UNDECORATE_REGEX.captures(source)?;
+    let name = captures.get(1).unwrap().as_str();
+    let module = captures.get(2).unwrap();
+    let module = String::from_utf8(
+        data_encoding::BASE32_NOPAD
+            .decode(module.as_str().as_bytes())
+            .unwrap(),
+    )
+    .unwrap();
+    Some((module, name))
+}
 
-        if pad {
-            let original_len = capture.get(0).unwrap().len();
-            format!("{:>len$}::", module, len = original_len - 2)
-        } else {
-            format!("{}::", module)
-        }
+pub(crate) fn demangle_mod_names(source: &str, pad: bool) -> Cow<'_, str> {
+    let Some((module, name)) = decompose_mangled_name(source) else {
+        return std::borrow::Cow::Borrowed(source);
+    };
+
+    Cow::Owned(if pad {
+        let original_len = source.len();
+        format!(
+            "{module:>len$}::{name}",
+            len = original_len - 2 - name.len()
+        )
+    } else {
+        format!("{module}::{name}")
     })
 }
 

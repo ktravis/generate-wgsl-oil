@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt::Display,
     path::PathBuf,
 };
@@ -7,10 +7,7 @@ use std::{
 use daggy::{petgraph::visit::IntoNodeReferences, Walker};
 use regex::{Captures, Regex};
 
-use crate::{
-    files::{AbsoluteRustRootPathBuf, AbsoluteWGSLFilePathBuf},
-    module::Module,
-};
+use crate::module::Module;
 
 lazy_static::lazy_static! {
     static ref IMPORT_CUSTOM_PATH_REGEX: Regex = Regex::new(r"(?:^|\n)\s*#\s*import\s+([^\s]+?\.wgsl)").unwrap();
@@ -52,38 +49,33 @@ fn all_imports_in_source(source: &str) -> HashSet<&str> {
     requirements
 }
 
-/// Finds all import declarations in a source file, returning all of the paths given.
-fn replace_import_names_in_source(source: &str, subs: impl Fn(&str) -> Option<String>) -> String {
-    let source = IMPORT_CUSTOM_PATH_REGEX.replace_all(source, |capture: &Captures<'_>| {
-        let full = capture.get(0).unwrap().as_str();
-
-        let name = capture.get(1).unwrap().as_str();
-        let sub = match subs(name) {
-            Some(sub) => sub,
-            None => return full.to_owned(),
-        };
-
-        // Right alignment is needed for naga_oil to correctly parse rust-style imports:
-        // `#import foo.wgsl::bar` will become `#import      foo::bar`
-        // naga_oil does not support spaces between import items
-        let sub = format!("{:>len$}", sub, len = name.len());
-
-        capture.get(0).unwrap().as_str().replace(name, &sub)
-    });
-
-    source.to_string()
-}
-
 pub(crate) fn replace_imports_in_source(
     source: &str,
     importing: &Module,
-    source_root: Option<&AbsoluteRustRootPathBuf>,
+    project_root: &PathBuf,
     module_names: &HashMap<Module, String>,
 ) -> String {
-    replace_import_names_in_source(source, |request_string| {
-        let import = Module::resolve_module(importing, source_root, request_string).ok()?;
-        module_names.get(&import).cloned()
-    })
+    IMPORT_CUSTOM_PATH_REGEX
+        .replace_all(source, |capture: &Captures<'_>| {
+            let full = capture.get(0).unwrap().as_str();
+
+            let name = capture.get(1).unwrap().as_str();
+            let sub = match Module::resolve_module(importing, &project_root, name)
+                .ok()
+                .and_then(|import| module_names.get(&import).cloned())
+            {
+                Some(sub) => sub,
+                None => return full.to_owned(),
+            };
+
+            // Right alignment is needed for naga_oil to correctly parse rust-style imports:
+            // `#import foo.wgsl::bar` will become `#import      foo::bar`
+            // naga_oil does not support spaces between import items
+            let sub = format!("{:>len$}", sub, len = name.len());
+
+            capture.get(0).unwrap().as_str().replace(name, &sub)
+        })
+        .to_string()
 }
 
 pub(crate) enum ImportResolutionError {
@@ -136,17 +128,14 @@ pub(crate) struct ImportOrder {
 impl ImportOrder {
     /// Given a root module, traverses the file system to find all imports
     pub(crate) fn calculate(
-        absolute_source_path: AbsoluteWGSLFilePathBuf,
-        source_root: Option<&AbsoluteRustRootPathBuf>,
+        root_module: &Module,
+        project_root: &PathBuf,
     ) -> Result<Self, ImportResolutionError> {
-        let root_import = Module::from_path(absolute_source_path);
-
         let mut order = daggy::Dag::<Module, ()>::new();
         let mut nodes = HashMap::new();
 
         // Follow a DFS over imports, detecting cycles using daggy.
-        let mut search_front =
-            std::collections::VecDeque::from(vec![(Option::<Module>::None, root_import.clone())]);
+        let mut search_front = VecDeque::from(vec![(Option::<Module>::None, root_module.clone())]);
         while let Some((importing_path, imported)) = search_front.pop_front() {
             // If we haven't seen the dependency before, add it to the record
             let imported_node = match nodes.get(&imported) {
@@ -179,28 +168,20 @@ impl ImportOrder {
             // Then add the imports requested by this file
             let source = imported.read_to_string();
             for requested in all_imports_in_source(&source) {
-                match Module::resolve_module(&imported, source_root, requested) {
-                    Ok(import) => search_front.push_back((Some(imported.clone()), import)),
-                    Err(err) => {
-                        return Err(ImportResolutionError::Unresolved {
-                            requested: requested.to_owned(),
-                            importer: imported,
-                            searched: err.into_iter().collect(),
-                        });
-                    }
-                }
+                let import = Module::resolve_module(&imported, project_root, requested)?;
+                search_front.push_back((Some(imported.clone()), import));
             }
         }
 
         Ok(ImportOrder {
             dag: order,
-            node_of_interest: nodes[&root_import],
+            node_of_interest: nodes[&root_module],
         })
     }
 
     /// Gives a vector of every node that needs to be imported, in order of import from leaf to the node of interest.
     /// The root node is excluded from the import order.
-    fn import_order(mut self) -> Vec<Module> {
+    pub(crate) fn modules(mut self) -> Vec<Module> {
         let mut res = Vec::new();
 
         // Drain dag
@@ -273,14 +254,5 @@ impl ImportOrder {
         }
 
         forwards
-    }
-
-    /// Gives a vector containing every file that needs to be imported, in order of import from leaf to the node of interest,
-    /// and the root module.
-    pub(crate) fn modules(self) -> (Vec<Module>, Module) {
-        let root = self.dag[self.node_of_interest].clone();
-        let imports = self.import_order();
-        assert!(!imports.contains(&root));
-        (imports, root)
     }
 }

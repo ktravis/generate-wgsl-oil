@@ -1,52 +1,15 @@
-use std::{borrow::Cow, collections::HashMap, fmt::Display, path::PathBuf};
-
-use naga_oil::compose::{
-    ComposableModuleDescriptor, NagaModuleDescriptor, ShaderDefValue, ShaderLanguage,
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    fmt::Display,
+    path::PathBuf,
 };
 
 use crate::{
     exports,
-    files::{AbsoluteRustRootPathBuf, AbsoluteWGSLFilePathBuf},
-    imports,
+    files::AbsoluteWGSLFilePathBuf,
+    imports::{self, ImportResolutionError},
 };
-
-pub(crate) struct OwnedComposableModuleDescriptor {
-    source: String,
-    file_path: String,
-    as_name: String,
-    shader_defs: HashMap<String, ShaderDefValue>,
-}
-
-impl OwnedComposableModuleDescriptor {
-    pub(crate) fn borrow_composable_descriptor(&self) -> ComposableModuleDescriptor<'_> {
-        ComposableModuleDescriptor {
-            source: &self.source,
-            file_path: &self.file_path,
-            language: ShaderLanguage::Wgsl,
-            as_name: Some(self.as_name.clone()),
-            additional_imports: &[],
-            shader_defs: self.shader_defs.clone(),
-        }
-    }
-}
-
-pub(crate) struct OwnedNagaModuleDescriptor {
-    source: String,
-    file_path: String,
-    shader_defs: HashMap<String, ShaderDefValue>,
-}
-
-impl OwnedNagaModuleDescriptor {
-    pub(crate) fn borrow_module_descriptor(&self) -> NagaModuleDescriptor<'_> {
-        NagaModuleDescriptor {
-            source: &self.source,
-            file_path: &self.file_path,
-            additional_imports: &[],
-            shader_defs: self.shader_defs.clone(),
-            shader_type: naga_oil::compose::ShaderType::Wgsl,
-        }
-    }
-}
 
 /// A single requested import to a shader.
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
@@ -63,10 +26,10 @@ impl Module {
     /// Given a path to a file and the string given to describe an import, tries to resolve the requested import file.
     pub(crate) fn resolve_module(
         importing: &Module,
-        source_root: Option<&AbsoluteRustRootPathBuf>,
+        project_root: &PathBuf,
         request_string: &str,
-    ) -> Result<Self, Vec<PathBuf>> {
-        let mut tried_paths = Vec::new();
+    ) -> Result<Self, ImportResolutionError> {
+        let mut searched = HashSet::new();
 
         // Try interpret as relative to importing file
         let parent = importing
@@ -74,79 +37,37 @@ impl Module {
             .parent()
             .expect("every absolute path to a file has a parent");
         let relative = parent.join(request_string);
-        tried_paths.push(relative.clone());
+        searched.insert(relative.clone());
         if relative.is_file() {
             let path = relative.canonicalize().unwrap();
-            return Ok(Self {
-                path: AbsoluteWGSLFilePathBuf::new(path),
-            });
+            return Ok(Self::from_path(AbsoluteWGSLFilePathBuf::new(path)));
         }
 
         // Try interpret as relative to source root
-        if let Some(source_root) = source_root {
-            let relative = source_root.join(request_string);
-            tried_paths.push(relative.clone());
-            if relative.is_file() {
-                let path = relative.canonicalize().unwrap();
-                return Ok(Self {
-                    path: AbsoluteWGSLFilePathBuf::new(path),
-                });
-            }
+        let relative = project_root.join(request_string);
+        searched.insert(relative.clone());
+        if relative.is_file() {
+            let path = relative.canonicalize().unwrap();
+            return Ok(Self::from_path(AbsoluteWGSLFilePathBuf::new(path)));
         }
 
-        Err(tried_paths)
-    }
-
-    pub(crate) fn to_composable_module_descriptor(
-        &self,
-        module_names: &HashMap<Module, String>,
-        source_root: Option<&AbsoluteRustRootPathBuf>,
-        definitions: HashMap<String, ShaderDefValue>,
-    ) -> Result<OwnedComposableModuleDescriptor, Vec<String>> {
-        let source = self.read_to_string();
-
-        if source.contains("#define") {
-            return Err(vec![format!(
-                "imported shader file `{}` contained a `#define` statement \
-                - only top-level files may contain preprocessor definitions",
-                self.path.display()
-            )]);
-        }
-
-        // Replace `@export` directives with equivalent whitespace
-        let (source, _) = exports::strip_exports(&source);
-
-        // Replace `#import` names with substitutions
-        let source = imports::replace_imports_in_source(&source, self, source_root, module_names);
-
-        let name = &module_names[self];
-        Ok(OwnedComposableModuleDescriptor {
-            source,
-            file_path: self.path.to_string_lossy().to_string(),
-            as_name: name.clone(),
-            shader_defs: definitions,
+        Err(ImportResolutionError::Unresolved {
+            requested: request_string.to_string(),
+            importer: importing.to_owned(),
+            searched,
         })
     }
 
-    pub(crate) fn to_naga_module_descriptor(
+    pub(crate) fn processed_source(
         &self,
         module_names: &HashMap<Module, String>,
-        source_root: Option<&AbsoluteRustRootPathBuf>,
-        definitions: HashMap<String, ShaderDefValue>,
-    ) -> Result<OwnedNagaModuleDescriptor, Vec<String>> {
+        project_root: &PathBuf,
+    ) -> String {
         let source = self.read_to_string();
-
         // Replace `@export` directives with equivalent whitespace
         let (source, _) = exports::strip_exports(&source);
-
         // Replace `#import` names with substitutions
-        let source = imports::replace_imports_in_source(&source, self, source_root, module_names);
-
-        Ok(OwnedNagaModuleDescriptor {
-            source,
-            file_path: self.path.to_string_lossy().to_string(),
-            shader_defs: definitions,
-        })
+        imports::replace_imports_in_source(&source, self, project_root, module_names)
     }
 
     pub(crate) fn path(&self) -> AbsoluteWGSLFilePathBuf {
@@ -164,9 +85,11 @@ impl Module {
 
     /// Gets the name of the file, without the `.wgsl` extension.
     pub(crate) fn file_name(&self) -> String {
-        let name = self.path.file_name().unwrap().to_string_lossy();
-        assert!(name.ends_with(".wgsl"));
-        name[..(name.len() - 5)].to_owned()
+        self.path
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
     }
 
     pub(crate) fn nth_path_component(&self, i: usize) -> Option<Cow<'_, str>> {

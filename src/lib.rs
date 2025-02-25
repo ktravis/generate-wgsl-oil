@@ -5,100 +5,129 @@ mod exports;
 mod files;
 mod imports;
 mod module;
-mod result;
 mod source;
 
-use std::{fs::File, io::Read, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
-use files::AbsoluteRustFilePathBuf;
-use quote::ToTokens;
-use source::Sourcecode;
-use syn::token::Brace;
+use naga_oil::compose::Composer;
+use naga_to_tokenstream::{ModuleToTokens, ModuleToTokensConfig};
+use quote::format_ident;
+use syn::parse_quote;
 
-// Hacky polyfill for `proc_macro::Span::source_file`
-fn find_me(root: &str, pattern: &str) -> Option<PathBuf> {
-    let mut options = Vec::new();
+use crate::{error::decompose_mangled_name, exports::Export, source::Sourcecode};
 
-    for path in glob::glob(&std::path::Path::new(root).join("**/*.rs").to_string_lossy())
-        .unwrap()
-        .flatten()
-    {
-        if let Ok(mut f) = File::open(&path) {
-            let mut contents = String::new();
-            f.read_to_string(&mut contents).ok();
-            if contents.contains(pattern) {
-                options.push(path.to_owned());
-            }
-        }
-    }
+fn module_items(source: &Sourcecode, module: &naga::Module, module_name: String) -> Vec<syn::Item> {
+    let mut items = Vec::new();
 
-    match options.as_slice() {
-        [] => None,
-        [v] => Some(v.clone()),
-        _ => panic!(
-            "found more than one contender for macro invocation location. \
-            This won't be an issue once `proc_macro_span` is stabalized, \
-            but until then each instance of the `include_wgsl_oil` \
-            must be present in the source text, and each must have a unique argument. \
-            found locations: {:?}",
-            options
-                .into_iter()
-                .map(|path| format!("`{}`", path.display()))
-                .collect::<Vec<String>>()
-        ),
-    }
+    // Convert to info about the module
+    let mut structs_filter: HashSet<String> = source
+        .exports()
+        .iter()
+        .map(|export| match export {
+            Export::Struct { struct_name } => struct_name.clone(),
+        })
+        .collect();
+    let type_overrides = module
+        .types
+        .iter()
+        .filter_map(|(_, t)| {
+            let original_name = t.name.clone()?;
+            let (module, name) = decompose_mangled_name(&original_name)?;
+            structs_filter.remove(&original_name);
+            let module = format_ident!("{}", module);
+            let name = format_ident!("{}", name);
+            Some((
+                original_name,
+                parse_quote! { super :: super :: super :: #module :: types :: #name },
+            ))
+        })
+        .collect();
+    let mut module_items = module.to_items(ModuleToTokensConfig {
+        structs_filter: Some(structs_filter),
+        gen_bytemuck: cfg!(feature = "bytemuck"),
+        gen_glam: cfg!(feature = "glam"),
+        gen_encase: cfg!(feature = "encase"),
+        gen_naga: cfg!(feature = "naga"),
+        type_overrides,
+        module_name,
+    });
+    items.append(&mut module_items);
+
+    items
 }
 
-#[proc_macro_attribute]
-pub fn include_wgsl_oil(
-    path: proc_macro::TokenStream,
-    module: proc_macro::TokenStream,
-) -> proc_macro::TokenStream {
-    // Parse module definitions and error if it contains anything
-    let mut module = syn::parse_macro_input!(module as syn::ItemMod);
-    if let Some(content) = &mut module.content {
-        if !content.1.is_empty() {
-            let item = syn::parse_quote_spanned! {content.0.span=>
-                compile_error!(
-                    "`include_wgsl_oil` expects an empty module into which to inject the shader objects, \
-                    but found a module body - try removing everything within the curly braces `{ ... }`.");
-            };
+pub fn generate_from_entrypoints(paths: &[String]) -> String {
+    let project_root = PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("code generation depends on cargo"),
+    );
 
-            module.content = Some((Brace::default(), vec![item]));
-        }
-    } else {
-        module.content = Some((Brace::default(), vec![]));
+    let mut composer = Composer::default().with_capabilities(naga::valid::Capabilities::all());
+    let mut validator = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    );
+
+    let mut shader_defs = HashMap::new();
+    if cfg!(debug_assertions) {
+        shader_defs.insert(
+            "__DEBUG".to_string(),
+            naga_oil::compose::ShaderDefValue::Bool(true),
+        );
     }
-    module.semi = None;
 
-    let requested_path = syn::parse_macro_input!(path as syn::LitStr);
-    let requested_path = requested_path.value();
+    let items = paths
+        .iter()
+        .map(|path| {
+            let module_name = PathBuf::from(path)
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let name = format_ident!("{}", &module_name);
+            let mut sourcecode = Sourcecode::new(project_root.clone(), path).unwrap();
 
-    let root = std::env::var("CARGO_MANIFEST_DIR").expect("proc macros should be run using cargo");
-    let invocation_path = match find_me(&root, &format!("\"{}\"", requested_path)) {
-        Some(invocation_path) => AbsoluteRustFilePathBuf::new(invocation_path),
-        None => {
-            panic!(
-                "could not find invocation point - maybe it was in a macro? This won't be an issue once \
-                `proc_macro_span` is stabalized, but until then each instance of the `include_wgsl_oil` \
-                must be present in the source text, and each must have a unique argument."
-            )
-        }
-    };
+            println!("cargo:rerun-if-changed={}", path);
+            for p in sourcecode.relative_dependents() {
+                println!("cargo:rerun-if-changed={}", p.to_str().unwrap());
+            }
 
-    let sourcecode = Sourcecode::new(invocation_path, requested_path);
-
-    let mut result = sourcecode.complete();
-
-    result.validate();
-
-    // Inject items
-    module
-        .content
-        .as_mut()
-        .expect("set to some at start")
-        .1
-        .append(&mut result.items());
-
-    module.to_token_stream().into()
+            let module = match sourcecode.compose(&mut composer, shader_defs.clone()) {
+                Ok(module) => module,
+                Err(e) => {
+                    return parse_quote! {
+                        pub mod #name {
+                            compile_error!(#e);
+                        }
+                    };
+                }
+            };
+            validator
+                .validate(&module)
+                .expect("Shader module validation failed");
+            let mod_items = module_items(&sourcecode, &module, module_name);
+            parse_quote! {
+                pub mod #name {
+                    #(#mod_items)*
+                }
+            }
+        })
+        .collect();
+    #[cfg(feature = "prettyplease")]
+    {
+        prettyplease::unparse(&syn::File {
+            items,
+            shebang: None,
+            attrs: vec![],
+        })
+    }
+    #[cfg(not(feature = "prettyplease"))]
+    {
+        let result = quote::quote! {
+            #(#items)*
+        };
+        result.to_string()
+    }
 }
