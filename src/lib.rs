@@ -19,7 +19,47 @@ use syn::parse_quote;
 
 use crate::{error::decompose_mangled_name, exports::Export, source::Sourcecode};
 
-fn module_items(source: &Sourcecode, module: &naga::Module, module_name: String) -> Vec<syn::Item> {
+#[derive(PartialEq, Eq)]
+pub struct VertexInput {
+    pub name: String,
+    pub fields: Vec<(u32, naga::StructMember)>,
+}
+
+fn vertex_input_types(
+    vertex_entry: &naga::EntryPoint,
+    module: &naga::Module,
+    module_name: &str,
+) -> Vec<(String, String)> {
+    vertex_entry
+        .function
+        .arguments
+        .iter()
+        .filter(|a| a.binding.is_none())
+        .filter_map(|argument| {
+            let arg_type = &module.types[argument.ty];
+            match &arg_type.inner {
+                naga::TypeInner::Struct { .. } => {
+                    let original = arg_type.name.as_ref().unwrap();
+                    match decompose_mangled_name(original) {
+                        // Type is from another module
+                        Some((module, type_name)) => Some((module, type_name.to_string())),
+                        // Type is from this module
+                        None => Some((module_name.to_string(), original.to_string())),
+                    }
+                }
+                // An argument has to have a binding unless it is a structure.
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn module_items(
+    source: &Sourcecode,
+    module: &naga::Module,
+    module_name: String,
+    vertex_inputs: Option<HashSet<String>>,
+) -> Vec<syn::Item> {
     let mut items = Vec::new();
 
     // Convert to info about the module
@@ -52,6 +92,7 @@ fn module_items(source: &Sourcecode, module: &naga::Module, module_name: String)
         gen_encase: cfg!(feature = "encase"),
         gen_naga: cfg!(feature = "naga"),
         type_overrides,
+        vertex_input_types: vertex_inputs,
         module_name,
     });
     items.append(&mut module_items);
@@ -78,6 +119,8 @@ pub fn generate_from_entrypoints(paths: &[String]) -> String {
         );
     }
 
+    let mut vertex_input_type_names: HashMap<String, HashSet<String>> = Default::default();
+
     let items = paths
         .iter()
         .map(|path| {
@@ -86,7 +129,7 @@ pub fn generate_from_entrypoints(paths: &[String]) -> String {
                 .unwrap()
                 .to_string_lossy()
                 .into_owned();
-            let name = format_ident!("{}", &module_name);
+            // TODO: convert to above below handling
             let mut sourcecode = Sourcecode::new(project_root.clone(), path).unwrap();
 
             println!("cargo:rerun-if-changed={}", path);
@@ -94,9 +137,37 @@ pub fn generate_from_entrypoints(paths: &[String]) -> String {
                 println!("cargo:rerun-if-changed={}", p.to_str().unwrap());
             }
 
-            let module = match sourcecode.compose(&mut composer, shader_defs.clone()) {
-                Ok(module) => module,
-                Err(e) => {
+            let module = sourcecode
+                .compose(&mut composer, shader_defs.clone())
+                .map_err(|e| (module_name.clone(), e))?;
+            // TODO: convert to above error handling
+            validator
+                .validate(&module)
+                .expect("Shader module validation failed");
+
+            module
+                .entry_points
+                .iter()
+                .filter(|e| e.stage == naga::ShaderStage::Vertex)
+                // find the (possibly imported) types used as vertex inputs
+                .flat_map(|e| vertex_input_types(e, &module, &module_name).into_iter())
+                // record the type name under the source's module
+                .for_each(|(module_name, type_name)| {
+                    vertex_input_type_names
+                        .entry(module_name)
+                        .or_default()
+                        .insert(type_name);
+                });
+
+            Ok((sourcecode, module, module_name))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|res| {
+            let (sourcecode, module, module_name) = match res {
+                Ok(x) => x,
+                Err((module_name, e)) => {
+                    let name = format_ident!("{}", module_name);
                     return parse_quote! {
                         pub mod #name {
                             compile_error!(#e);
@@ -104,10 +175,9 @@ pub fn generate_from_entrypoints(paths: &[String]) -> String {
                     };
                 }
             };
-            validator
-                .validate(&module)
-                .expect("Shader module validation failed");
-            let mod_items = module_items(&sourcecode, &module, module_name);
+            let name = format_ident!("{}", module_name);
+            let vertex_inputs = vertex_input_type_names.remove(module_name.as_str());
+            let mod_items = module_items(&sourcecode, &module, module_name, vertex_inputs);
             parse_quote! {
                 pub mod #name {
                     #(#mod_items)*
